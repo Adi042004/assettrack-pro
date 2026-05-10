@@ -1,20 +1,14 @@
-import sqlite3
 import qrcode
 import base64
 import io
+import os
 from pathlib import Path
 from typing import Optional
 
+import psycopg2
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-
-# ── Absolute paths ────────────────────────────────────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
-DB_PATH  = BASE_DIR / "assets.db"
-QR_DIR   = BASE_DIR / "qr_codes"
-QR_DIR.mkdir(exist_ok=True)
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(title="AssetTrack Pro API", version="2.0.0")
@@ -27,29 +21,37 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/qr_codes", StaticFiles(directory=str(QR_DIR)), name="qr_codes")
+# ── DB ────────────────────────────────────────────────────────────────────────
+DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# ── DB helpers ────────────────────────────────────────────────────────────────
 def get_db():
-    conn = sqlite3.connect(str(DB_PATH))
-    conn.row_factory = sqlite3.Row
-    return conn
+    return psycopg2.connect(DATABASE_URL)
 
-def init_db():
-    conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS assets (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            name     TEXT    NOT NULL,
-            value    TEXT    NOT NULL,
-            location TEXT    NOT NULL DEFAULT 'Office',
-            status   TEXT    NOT NULL DEFAULT 'Active'
-        )
-    """)
-    conn.commit()
-    conn.close()
+def fetchall_dict(cur):
+    cols = [d[0] for d in cur.description]
+    return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-init_db()
+def fetchone_dict(cur):
+    cols = [d[0] for d in cur.description]
+    row  = cur.fetchone()
+    return dict(zip(cols, row)) if row else None
+
+# ── QR helper ─────────────────────────────────────────────────────────────────
+def generate_qr_base64(value: str) -> str:
+    img = qrcode.make(value)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+def asset_row_to_dict(row) -> dict:
+    return {
+        "id":       row["id"],
+        "name":     row["name"],
+        "value":    row["value"],
+        "location": row["location"],
+        "status":   row["status"],
+        "qr_code":  row.get("qr_base64"),
+    }
 
 # ── Pydantic models ───────────────────────────────────────────────────────────
 class AssetIn(BaseModel):
@@ -59,26 +61,7 @@ class AssetIn(BaseModel):
     status:   Optional[str] = "Active"
 
 class ScanIn(BaseModel):
-    value: str   # the decoded QR string coming from the browser
-
-# ── QR helper ─────────────────────────────────────────────────────────────────
-def generate_qr(asset_id: int, value: str) -> str:
-    filename = f"asset_{asset_id}.png"
-    img = qrcode.make(value)
-    img.save(str(QR_DIR / filename))
-    return filename
-
-def asset_row_to_dict(row, base_url: str = "http://127.0.0.1:8000") -> dict:
-    qr_filename = f"asset_{row['id']}.png"
-    qr_exists   = (QR_DIR / qr_filename).exists()
-    return {
-        "id":       row["id"],
-        "name":     row["name"],
-        "value":    row["value"],
-        "location": row["location"],
-        "status":   row["status"],
-        "qr_code":  f"{base_url}/qr_codes/{qr_filename}" if qr_exists else None,
-    }
+    value: str
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
@@ -90,14 +73,16 @@ def root():
 def add_asset(asset: AssetIn):
     conn = get_db()
     try:
-        cur = conn.execute(
-            "INSERT INTO assets (name, value, location, status) VALUES (?, ?, ?, ?)",
-            (asset.name, asset.value, asset.location, asset.status),
+        qr_base64 = generate_qr_base64(asset.value)
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO assets (name, value, location, status, qr_base64) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+            (asset.name, asset.value, asset.location, asset.status, qr_base64),
         )
+        asset_id = cur.fetchone()[0]
         conn.commit()
-        asset_id = cur.lastrowid
-        generate_qr(asset_id, asset.value)
-        row = conn.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
+        cur.execute("SELECT * FROM assets WHERE id = %s", (asset_id,))
+        row = fetchone_dict(cur)
         return {"success": True, "asset": asset_row_to_dict(row)}
     except Exception as e:
         conn.rollback()
@@ -110,7 +95,9 @@ def add_asset(asset: AssetIn):
 def get_assets():
     conn = get_db()
     try:
-        rows = conn.execute("SELECT * FROM assets ORDER BY id DESC").fetchall()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM assets ORDER BY id DESC")
+        rows = fetchall_dict(cur)
         return {"assets": [asset_row_to_dict(r) for r in rows]}
     finally:
         conn.close()
@@ -120,7 +107,9 @@ def get_assets():
 def get_asset(asset_id: int):
     conn = get_db()
     try:
-        row = conn.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM assets WHERE id = %s", (asset_id,))
+        row = fetchone_dict(cur)
         if not row:
             raise HTTPException(status_code=404, detail="Asset not found")
         return {"asset": asset_row_to_dict(row)}
@@ -132,13 +121,13 @@ def get_asset(asset_id: int):
 def get_stats():
     conn = get_db()
     try:
-        total = conn.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
-        status_rows   = conn.execute(
-            "SELECT status, COUNT(*) as count FROM assets GROUP BY status"
-        ).fetchall()
-        location_rows = conn.execute(
-            "SELECT location, COUNT(*) as count FROM assets GROUP BY location"
-        ).fetchall()
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM assets")
+        total = cur.fetchone()[0]
+        cur.execute("SELECT status, COUNT(*) as count FROM assets GROUP BY status")
+        status_rows = fetchall_dict(cur)
+        cur.execute("SELECT location, COUNT(*) as count FROM assets GROUP BY location")
+        location_rows = fetchall_dict(cur)
         return {
             "total":           total,
             "status_counts":   {r["status"]:   r["count"] for r in status_rows},
@@ -150,26 +139,14 @@ def get_stats():
 
 @app.post("/scan")
 def scan_qr(body: ScanIn):
-    """
-    Receives the decoded QR string from the browser camera and looks up
-    the matching asset by its value field.
-    """
     conn = get_db()
     try:
-        row = conn.execute(
-            "SELECT * FROM assets WHERE value = ?", (body.value.strip(),)
-        ).fetchone()
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM assets WHERE value = %s", (body.value.strip(),))
+        row = fetchone_dict(cur)
         if not row:
-            return {
-                "found":   False,
-                "message": f"No asset found with value '{body.value}'",
-                "asset":   None,
-            }
-        return {
-            "found":   True,
-            "message": "Asset located successfully",
-            "asset":   asset_row_to_dict(row),
-        }
+            return {"found": False, "message": f"No asset found with value '{body.value}'", "asset": None}
+        return {"found": True, "message": "Asset located successfully", "asset": asset_row_to_dict(row)}
     finally:
         conn.close()
 
@@ -178,16 +155,17 @@ def scan_qr(body: ScanIn):
 def update_asset(asset_id: int, asset: AssetIn):
     conn = get_db()
     try:
-        conn.execute(
-            "UPDATE assets SET name=?, value=?, location=?, status=? WHERE id=?",
-            (asset.name, asset.value, asset.location, asset.status, asset_id),
+        qr_base64 = generate_qr_base64(asset.value)
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE assets SET name=%s, value=%s, location=%s, status=%s, qr_base64=%s WHERE id=%s",
+            (asset.name, asset.value, asset.location, asset.status, qr_base64, asset_id),
         )
         conn.commit()
-        row = conn.execute("SELECT * FROM assets WHERE id = ?", (asset_id,)).fetchone()
+        cur.execute("SELECT * FROM assets WHERE id = %s", (asset_id,))
+        row = fetchone_dict(cur)
         if not row:
             raise HTTPException(status_code=404, detail="Asset not found")
-        # Regenerate QR if value changed
-        generate_qr(asset_id, asset.value)
         return {"success": True, "asset": asset_row_to_dict(row)}
     except HTTPException:
         raise
@@ -202,11 +180,9 @@ def update_asset(asset_id: int, asset: AssetIn):
 def delete_asset(asset_id: int):
     conn = get_db()
     try:
-        conn.execute("DELETE FROM assets WHERE id = ?", (asset_id,))
+        cur = conn.cursor()
+        cur.execute("DELETE FROM assets WHERE id = %s", (asset_id,))
         conn.commit()
-        qr_path = QR_DIR / f"asset_{asset_id}.png"
-        if qr_path.exists():
-            qr_path.unlink()
         return {"success": True, "message": f"Asset {asset_id} deleted"}
     except Exception as e:
         conn.rollback()
