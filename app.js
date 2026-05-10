@@ -2,7 +2,7 @@
 ───────────────────────────────────────────────────────────────────────── */
 
 const { useState, useEffect, useRef, useCallback } = React;
-const API = "http://127.0.0.1:8000";
+const API = "https://assettrack-pro.onrender.com";
 
 /* ── Credentials (Final Year Project — lightweight auth) ─────────────────── */
 const VALID_ID  = "wizzy";
